@@ -14,7 +14,7 @@ import cv2
 import rospy
 import numpy as np
 
-from fleet_msgs.msg import PlanRequest, Path, Point
+from fleet_msgs.msg import PlanRequest, Path, Point, Heading
 
 class AStar():
     def __init__(self, map):
@@ -23,6 +23,7 @@ class AStar():
 
         # hyperparameters
         self.turn_cost = 50
+        self.init_heading_cost_amp = 10000
         self.neighbors = np.asarray(
             ((1,0),
             (0,1),
@@ -58,7 +59,7 @@ class AStar():
             return 0
 
         cosine_similarity = np.dot(a,b)/np.linalg.norm(a)/np.linalg.norm(b)
-        return self.turn_cost*(1-0.5*cosine_similarity)
+        return self.turn_cost*((1-0.5*cosine_similarity)**40)
 
     '''
     Visualization
@@ -94,14 +95,19 @@ class AStar():
         cv2.waitKey(wait)
 
     '''
-    A* planning algorithm
+     Not A* planning algorithm
     '''
-    def __planning(self, start, end, heading=None, visualization = False):
+    def __planning(self, start, end, heading=None, visualization = False, first_path=False, last_path=False, init_id=None):
         
         cf = np.zeros((self.shape[0], self.shape[1], 3), dtype=int) # (h, g, c)
         o = np.zeros(self.shape, dtype=int)
         parent = np.zeros((self.shape[0], self.shape[1], 2), dtype=int)
+        max_cost = np.max(self.map)
 
+        init_head_amp = 1.0
+        if first_path:
+            init_head_amp = self.init_heading_cost_amp    
+        
         # initialization
         explor = []
         o[start[1], start[0]] = 2
@@ -110,12 +116,27 @@ class AStar():
             if self.__inMap(p):
                 explor.append(p)
 
-                cf[p[1],p[0]] = (
+                new_config =  np.asarray((
                     np.sum(np.abs(end-p)),
-                    self.map[p[1],p[0]]+1,
-                    self.__headingCost(n,heading))
+                    1 + (init_id if init_id is not None else 0),
+                    self.__headingCost(n,heading)*init_head_amp))
 
-                parent[p[1],p[0]] = start
+                #print(f'{heading} : {n} : {self.__headingCost(n,heading)}')
+                # For confined path
+                if new_config[1]==self.map[p[1],p[0]] or (new_config[1]>max_cost and self.map[p[1],p[0]]==max_cost):
+                    new_config[1] += 123456789
+
+                # Switching
+                if new_config[1]==self.map[n[1],n[0]] and new_config[1]-1==self.map[p[1],p[0]]:
+                    new_config[1] += 123456789
+
+                # Blocking
+                if last_path and new_config[1]<=self.map[p[1],p[0]] and (p[0]==end[0] and p[1]==end[1]):
+                    new_config[1] += 123456789
+
+                if cf[p[1],p[0],1] == 0 or np.sum(new_config)<np.sum(cf[p[1],p[0]]):
+                    cf[p[1],p[0]] = new_config
+                    parent[p[1],p[0]] = start
 
 
         #planning
@@ -140,9 +161,23 @@ class AStar():
                     pheading = n - parent[n[1],n[0]]
                     new_config = np.asarray((
                         np.sum(np.abs(end-p)),
-                        cf[n[1],n[0],1]+self.map[p[1],p[0]]+1,
+                        cf[n[1],n[0],1]+1,
                         self.__headingCost(neighbor,pheading)),
                         dtype=int)
+
+                    #print(f'{heading} : {n} : {new_config[2]}')
+                    #print(last_path, new_config[1], self.map[p[1],p[0]], (p[0]==end[0] and p[1]==end[1]))
+                    # For confined path
+                    if new_config[1]==self.map[p[1],p[0]] or (new_config[1]>max_cost and self.map[p[1],p[0]]==max_cost):
+                        new_config[1] += 123456789
+
+                    # Switching
+                    if new_config[1]==self.map[n[1],n[0]] and new_config[1]-1==self.map[p[1],p[0]]:
+                        new_config[1] += 123456789
+
+                    # Blocking
+                    if last_path and new_config[1]<=self.map[p[1],p[0]] and (p[0]==end[0] and p[1]==end[1]):
+                        new_config[1] += 123456789
 
                     if cf[p[1],p[0],1] == 0 or np.sum(new_config)<np.sum(cf[p[1],p[0]]):
                         cf[p[1],p[0]] = new_config
@@ -156,12 +191,12 @@ class AStar():
     '''
     Public calls
     '''
-    def PlanePath(self, start, end, heading, visualization=False):
+    def PlanePath(self, start, end, heading, visualization=False, first_path=False, last_path=False, init_id=None):
 
         if np.all(start == end):
             return Path(path=[Point(x=start[0], y=start[1]), Point(x=end[0], y=end[1])]), heading
 
-        path = self.__planning(start, end, heading, visualization=visualization)
+        path = self.__planning(start, end, heading, visualization=visualization, first_path=first_path, last_path=last_path, init_id=init_id)
         if path is None:
             return None,None
 
@@ -172,14 +207,15 @@ class AStar():
         path = Path()
         path.target = waypoints.target
 
-        for i in range(1, len(waypoints.path)):
+        path_len = len(waypoints.path)
+        for i in range(1, path_len):
 
             if len(path.path)>0:
                 path.path.pop()    # pop one last to prevent repeat node
 
             start = self.__pose2np(waypoints.path[i-1])
             end = self.__pose2np(waypoints.path[i])
-            subpath, heading = self.PlanePath(start, end, heading, visualization=visualize_process)
+            subpath, heading = self.PlanePath(start, end, heading, visualization=visualize_process, first_path=(i==1), last_path=(i==path_len-1), init_id=len(path.path))
             path.path.extend(subpath.path)
 
         id=0
@@ -194,22 +230,27 @@ class AStar():
         
 
 class PlannerNode():
-  def __init__(self, node_name):
-    rospy.init_node(node_name, anonymous=True)
-    
-    self.planner = None
-    rospy.Subscriber('planner/plan', PlanRequest, callback=self.plan_cb, queue_size=1)
-    self.path_pub = rospy.Publisher('console/path', Path, queue_size=10)
+    def __init__(self, node_name):
+        rospy.init_node(node_name, anonymous=True)
+        
+        self.planner = None
+        rospy.Subscriber('planner/plan', PlanRequest, callback=self.plan_cb, queue_size=1)
+        self.path_pub = rospy.Publisher('console/path', Path, queue_size=10)
 
-  def plan_cb(self, msg: PlanRequest):
-        w,h = msg.costmap.info.width, msg.costmap.info.height
-        rospy.loginfo(f'Planner: receive a map with size:{(w, h)}')
-        map = np.asarray(msg.costmap.data).reshape(h,w)
-        self.planner = AStar(map)
+    def __h2np(self, heading: Heading):
+        if heading.used:
+            return np.asarray((heading.x, heading.y), dtype=int)
+        return None
 
-        rospy.loginfo(f'Planner: receive a task with {len(msg.waypoints.path)} waypoints')
-        path = self.planner.PathFromWaypoints(msg.waypoints)
-        self.path_pub.publish(path)
+    def plan_cb(self, msg: PlanRequest):
+            w,h = msg.costmap.info.width, msg.costmap.info.height
+            rospy.loginfo(f'Planner: receive a map with size:{(w, h)}')
+            map = np.asarray(msg.costmap.data).reshape(h,w)
+            self.planner = AStar(map)
+
+            rospy.loginfo(f'Planner: receive a task with {len(msg.waypoints.path)} waypoints')
+            path = self.planner.PathFromWaypoints(msg.waypoints, heading=self.__h2np(msg.heading))
+            self.path_pub.publish(path)
             
 if __name__ == '__main__':
     planner = PlannerNode('planner')

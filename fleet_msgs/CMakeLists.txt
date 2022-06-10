@@ -52,11 +52,12 @@ find_package(catkin REQUIRED COMPONENTS
 ## Generate messages in the 'msg' folder
 add_message_files(
   FILES
-  PlanRequest.msg
+  Heading.msg
   Point.msg
   Path.msg
   Status.msg
   FleetStatus.msg
+  PlanRequest.msg
 )
 
 ## Generate services in the 'srv' folder

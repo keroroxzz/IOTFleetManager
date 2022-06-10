@@ -10,26 +10,49 @@ Description:
     The control panel with PyQT UI interface. This panel is responsible for display fleet status, fleet contorl, sending commands with GUI.
 '''
 
+from os import stat
 import rospy
 import numpy as np
 
 from nav_msgs.msg import OccupancyGrid, MapMetaData
 from fleet_msgs.msg import PlanRequest, Path, Point, Status, FleetStatus
 
-from functools import partial
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import *
+from PyQt5.QtGui import *
+from PyQt5.QtWidgets import *
 
-class GridMap(QtGui.QPolygon):
-    def __init__(self, rect, mapsize, node_radius, qp):
+class WindowStyle():
+    def __init__(self):
+        self.backgroundcolor = QColor(75,75,75)
+        self.border = QColor(0,0,0,0)
+        self.node = QColor(100,100,100)
+        self.nodeborder = QColor(0,0,0,0)
+        self.button = QColor(100,100,100)
+        self.text = QColor(222,222,222,255)
+        self.beg_color=(200,50,0)
+        self.end_color=(0,50,200)
+        self.current_color=(255,255,0)
+
+style = WindowStyle()
+
+class GridMap(QPolygon):
+    def __init__(self, rect, mapsize, node_radius, qp: QPainter):
         super().__init__()
         self.rect = np.asarray(rect, dtype=int)
         self.mapsize = np.asarray(mapsize, dtype=int)
         self.node_radius = node_radius
         self.grid_size = self.rect[2:]/(self.mapsize+1) #grid size
-        self.qp = qp
-
         self.__rgb_vec = np.asarray(((np.cos(0.0), np.sin(0.0)), (np.cos(2.094395), np.sin(2.094395)),(np.cos(4.18879), np.sin(4.18879))), dtype=float)
 
+        # scales in Q objects
+        self.gs_Q = QPoint(self.grid_size[0], self.grid_size[1]) #grid size
+        self.rect_Q = QRect(self.rect[0],self.rect[1],self.rect[2],self.rect[3])
+
+        self.qp = qp
+
+        self.__init_map()
+
+    def __init_map(self):
         w,h = self.mapsize
         ox,oy,gw,gh = self.rect
 
@@ -38,7 +61,7 @@ class GridMap(QtGui.QPolygon):
         
         for x in self.x_mapping:
             for y in self.y_mapping:
-                self << QtCore.QPoint(int(x), int(y))
+                self << QPoint(int(x), int(y))
 
     def __rainbow(self, num):
         angle = np.linspace(0.0, 3.14159*2.0*((num-1)/num), num=num)[:,np.newaxis]
@@ -48,28 +71,43 @@ class GridMap(QtGui.QPolygon):
         rgb = exp/np.sum(exp,axis=1, keepdims=True)*255.0
         return np.clip(rgb.astype(int), 0, 255)
 
-    def draw(self):
+    def drawBackground(self):
+        self.qp.setPen(style.border)
+        self.qp.setBrush(style.backgroundcolor)
+        self.qp.drawRect(self.rect_Q)
 
-        self.qp.setBrush(QtGui.QColor(0,0,0))
+    def drawGridMap(self):
+
+        self.drawBackground()
         for i in range(self.count()):
-            self.qp.drawEllipse(self.at(i), self.node_radius, self.node_radius)
+            self.drawNode(point = self.at(i), color=(100,100,100))
 
-    def getFocus(self, e: QtGui.QMouseEvent):
+    def getFocus(self, e: QMouseEvent):
         mouse = np.asarray((e.pos().x(), e.pos().y()), dtype=float)
 
         mouse = (mouse - self.rect[:2] - self.grid_size)    #mouse position in subcoordinate
         closest_target = np.round(mouse/self.grid_size).astype(int)
         relative_position = closest_target*self.grid_size - mouse
+
+        if np.any(closest_target < 0) or np.any(closest_target > self.mapsize):
+            return None
         if np.linalg.norm(relative_position) < self.node_radius:
             return closest_target
         return None
 
-    def drawNode(self, x, y, color):
+    def drawNode(self, x=0, y=0, color=(0,0,0), point:QPoint = None, str=None):
 
-        self.qp.setBrush(QtGui.QColor(color[0],color[1],color[2]))
-        self.qp.drawEllipse(QtCore.QPoint(x,y), self.node_radius, self.node_radius)
+        self.qp.setPen(style.nodeborder)
+        self.qp.setBrush(QColor(color[0],color[1],color[2]))
 
-    def drawPath(self, path: Path, beg_color=(255,0,0), end_color=(0,0,255)):
+        p = QPoint(x,y) if point is None else point
+        self.qp.drawEllipse( p, self.node_radius, self.node_radius)
+        
+        if str is not None:
+            self.qp.setPen(style.text)
+            self.qp.drawText(QRectF(p - self.gs_Q, p + self.gs_Q), Qt.AlignCenter, str)
+
+    def drawPath(self, path: Path, status: Status = None, beg_color=style.beg_color, end_color=style.end_color):
 
         shift = self.grid_size + self.rect[:2]
 
@@ -80,26 +118,33 @@ class GridMap(QtGui.QPolygon):
         for p in path.path:
             i+=1
             fuse_color = (beg_color*(1.0-i/l) + end_color*i/l).astype(int)
-
             pos = np.asarray((p.x,p.y), dtype=int)*self.grid_size + shift
+            self.drawNode(x=pos[0], y=pos[1], color=fuse_color, str=f'{p.id}')
 
-            self.drawNode(pos[0], pos[1], fuse_color)
+        if status is not None:
+            pos = np.asarray((status.current.x,status.current.y), dtype=int)*self.grid_size + shift
+            self.drawNode(x=pos[0], y=pos[1], color=style.current_color)
             
     def drawMultiplePaths(self, paths, allstatus):
 
         shift = self.grid_size + self.rect[:2]
 
+        valid_cars = allstatus.keys()
         paths = paths.values()
         rainbow = self.__rainbow(len(paths))
         for color,path in zip(rainbow,paths):
-            status = allstatus[path.target]
-            for p in path.path[status.current.id: status.current.id+3]:
+            if path.target in valid_cars:
+                status = allstatus[path.target]
+                near_plan = path.path[status.current.id: status.current.id+3]
+                if len(near_plan)==1:
+                    pos = np.asarray((status.current.x,status.current.y), dtype=int)*self.grid_size + shift
+                    self.drawNode(x=pos[0], y=pos[1], color=color)
+                else:
+                    for p in near_plan:
+                        pos = np.asarray((p.x,p.y), dtype=int)*self.grid_size + shift
+                        self.drawNode(x=pos[0], y=pos[1], color=color, str=f'{p.id}')
 
-                pos = np.asarray((p.x,p.y), dtype=int)*self.grid_size + shift
-
-                self.drawNode(pos[0], pos[1], color)
-
-class PanelUI(QtWidgets.QMainWindow):
+class PanelUI(QMainWindow):
     '''
     The panel UI implemented with PyQT5
     '''
@@ -107,49 +152,54 @@ class PanelUI(QtWidgets.QMainWindow):
         super().__init__()
         self.resize(800, 600)
 
-        # self.gridMap = QtWidgets.QFrame(self)
-        # self.gridMap.setObjectName("Grid Frame")
-        # self.gridMap.setGeometry(QtCore.QRect(50, 50, 700, 400))
-        # self.gridButtonList = []
-        self.qp = QtGui.QPainter(self)
+        self.qp = QPainter(self)
         self.draw_multi_targets = None
         self.draw_target = None
+        self.setStyleSheet("background-color: rgb(50, 50, 50); color: rgb(222,222,222)")
 
-        self.planeButton = QtWidgets.QPushButton(self)
-        self.planeButton.setGeometry(QtCore.QRect(520, 490, 80, 25))
+        self.planButtons = QWidget(self)
+        self.planButtons.setGeometry(QRect(400, 490, 300, 60))
+        self.planButtons.setObjectName("planButtons")
+        self.planButtons.setContentsMargins(0, 0, 0, 0)
+        self.planButtonLayout = QHBoxLayout(self.planButtons)
+        self.planButtonLayout.setObjectName("planButtonLayout")
+
+        self.planeButton = QPushButton(self.planButtons)
         self.planeButton.setObjectName("planeButton")
         self.planeButton.setText('Planning')
+        self.planButtonLayout.addWidget(self.planeButton)
 
-        self.resetButton = QtWidgets.QPushButton(self)
-        self.resetButton.setGeometry(QtCore.QRect(620, 490, 80, 25))
+        self.resetButton = QPushButton(self.planButtons)
         self.resetButton.setObjectName("resetPathButton")
         self.resetButton.setText('Reset')
+        self.planButtonLayout.addWidget(self.resetButton)
 
-        self.sendButton = QtWidgets.QPushButton(self)
-        self.sendButton.setGeometry(QtCore.QRect(520, 525, 80, 25))
+        self.sendButton = QPushButton(self.planButtons)
         self.sendButton.setObjectName("sendPlan")
         self.sendButton.setText('Send Plan')
+        self.planButtonLayout.addWidget(self.sendButton)
 
-        self.sendButton = QtWidgets.QPushButton(self)
-        self.sendButton.setGeometry(QtCore.QRect(400, 525, 80, 25))
-        self.sendButton.setObjectName("setSize")
-        self.sendButton.setText('Set Map')
-
-        self.horizontalLayoutWidget = QtWidgets.QWidget(self)
-        self.horizontalLayoutWidget.setGeometry(QtCore.QRect(400, 450, 200, 35))
+        self.horizontalLayoutWidget = QWidget(self)
+        self.horizontalLayoutWidget.setGeometry(QRect(400, 450, 200, 50))
         self.horizontalLayoutWidget.setObjectName("horizontalLayoutWidget")
-        self.MapSize = QtWidgets.QHBoxLayout(self.horizontalLayoutWidget)
-        self.MapSize.setContentsMargins(0, 0, 0, 0)
+        self.horizontalLayoutWidget.setContentsMargins(0, 0, 0, 0)
+        self.MapSize = QHBoxLayout(self.horizontalLayoutWidget)
         self.MapSize.setObjectName("MapSize")
-        self.width = QtWidgets.QLineEdit(self.horizontalLayoutWidget)
+        self.width = QLineEdit(self.horizontalLayoutWidget)
         self.width.setObjectName("width")
         self.MapSize.addWidget(self.width)
-        self.height = QtWidgets.QLineEdit(self.horizontalLayoutWidget)
+        self.height = QLineEdit(self.horizontalLayoutWidget)
         self.height.setObjectName("height")
         self.MapSize.addWidget(self.height)
 
-        self.targetlist = QtWidgets.QListWidget(self)
-        self.targetlist.setGeometry(QtCore.QRect(70, 450, 200, 100))
+        self.setMapButton = QPushButton(self.horizontalLayoutWidget)
+        self.setMapButton.setGeometry(QRect(520, 450, 80, 25))
+        self.setMapButton.setObjectName("setSize")
+        self.setMapButton.setText('Set Map')
+        self.MapSize.addWidget(self.setMapButton)
+
+        self.targetlist = QListWidget(self)
+        self.targetlist.setGeometry(QRect(70, 450, 200, 100))
         self.targetlist.setObjectName("targetlist")
         self.targetlist.addItem("dashboard")
         self.targetlist.addItem("car_1")
@@ -174,95 +224,68 @@ class PanelUI(QtWidgets.QMainWindow):
         self.resetButton.clicked.connect(self.__resetWaypoints)
         self.sendButton.clicked.connect(self.__sendPlane)
         self.targetlist.itemClicked.connect(self.__changeTarget)
-        self.width.textChanged.connect(self.__changeSize)
-        self.height.textChanged.connect(self.__changeSize)
+        self.setMapButton.clicked.connect(self.__changeSize)
 
-        QtCore.QMetaObject.connectSlotsByName(self)
+        QMetaObject.connectSlotsByName(self)
+        self.gridMap = GridMap((50, 30, 700, 400), (10,10), 15, qp=self.qp)
 
-        self.__changeSize()
         self.show()
 
-    
-    def mouseMoveEvent(self, e: QtGui.QMouseEvent):
-        target=self.gridMap.getFocus(e)
-        if target is not None:
-            print(target)
-            self.update()
-
     def mousePressEvent(self, e):
+
+        if self.isDashBoardMode():
+            rospy.logdebug('It\'s dashboard mode. No opreation allowed.')
+            return
+
         target=self.gridMap.getFocus(e)
         if target is not None:
             self.gridClickedF(target[0], target[1], self.getTarget())
             self.update()
         
     def paintEvent(self, ev):
+
         if not self.qp.isActive():
             self.qp.begin(self)
-        self.gridMap.draw()
+
+        self.qp.setRenderHint(QPainter.Antialiasing, True)
+        self.qp.setRenderHint(QPainter.HighQualityAntialiasing, True)
+        self.qp.setRenderHint(QPainter.SmoothPixmapTransform, True)
+
+        self.gridMap.drawGridMap()
         if self.draw_target is not None:
-            self.gridMap.drawPath(self.draw_target)
+            self.gridMap.drawPath(self.draw_target[0], self.draw_target[1])
         if self.draw_multi_targets is not None:
             self.gridMap.drawMultiplePaths(self.draw_multi_targets[0], self.draw_multi_targets[1])
-        self.qp.end()
+
+        if self.qp.isActive():
+            self.qp.end()
     '''
     Private functions
     '''
-
-    def __resetGridMap(self):
-        for button in self.__iterButton():
-            self.__setButtonColor(rgb=(255,255,255),button=button).setText('')
                
     def __retranslateUi(self, Dialog):
-        _translate = QtCore.QCoreApplication.translate
+        _translate = QCoreApplication.translate
         Dialog.setWindowTitle(_translate("Dialog", "Dialog"))
 
     # callbacks of weidgets
     def __changeSize(self):
-
-        self.gridMap = GridMap((50, 50, 700, 400), (self.getMapSize()), 15, qp=self.qp)
-        # w,h = self.getMapSize()
-        # gw,gh = self.gridMap.geometry().width(),self.gridMap.geometry().height()
-        # sx, sy = gw/w, gh/h
-
-        # buttonSize = min(30,sx,sy)
-        # offset = (sx/2-buttonSize/2, sy/2-buttonSize/2)
-
-        # if w<=0 or h<=0:
-        #     return
-
-        # for b in self.__iterButton():
-        #     b.deleteLater()
-        #     b.setVisible(False)
-        
-        # col=[]
-        # for x in range(w):
-        #     row = []
-        #     for y in range(h):
-        #         button = QtWidgets.QPushButton(self.gridMap)
-        #         button.setGeometry(QtCore.QRect(x*sx+offset[0],y*sy+offset[1], buttonSize, buttonSize))
-        #         button.setObjectName(f"{x}_{y}")
-        #         self.__setButtonColor(rgb=(255,255,255),button=button)
-        #         button.clicked.connect(partial(self.__gridClicked, button, x, y))
-        #         row.append(button)
-        #     col.append(row)
-        # self.gridButtonList=col
-        
-        # self.sizeChangedF(w,h)
+        w,h = self.getMapSize()
+        self.gridMap = GridMap((50, 30, 700, 400), (w,h), 15, qp=self.qp)
         self.update()
+        self.sizeChangedF(w,h)
 
     # clicked events of weidgets
     def __sendPlane(self):
 
         if self.isDashBoardMode():
-            rospy.loginfo('It\'s dashboard mode. No opreation allowed.')
-            return
-
-        self.sendPlaneF(self.getTarget())
+            self.sendPlaneF()
+        else:
+            self.sendPlaneF(self.getTarget())
 
     def __sendWaypoints(self):
 
         if self.isDashBoardMode():
-            rospy.loginfo('It\'s dashboard mode. No opreation allowed.')
+            rospy.logdebug('It\'s dashboard mode. No opreation allowed.')
             return
 
         self.sendWaypointF(self.getTarget())
@@ -270,19 +293,11 @@ class PanelUI(QtWidgets.QMainWindow):
     def __resetWaypoints(self):
 
         if self.isDashBoardMode():
-            rospy.loginfo('It\'s dashboard mode. No opreation allowed.')
+            rospy.logdebug('It\'s dashboard mode. No opreation allowed.')
             return
 
         self.resetWaypointF(self.getTarget())
-        self.__resetGridMap()
-
-    def __gridClicked(self, button, x, y):
-
-        if self.isDashBoardMode():
-            rospy.loginfo('It\'s dashboard mode. No opreation allowed.')
-            return
-
-        self.gridClickedF(x, y, self.getTarget())
+        self.update()
 
     def __changeTarget(self, item):
         rospy.loginfo(f'Select target {item.text()}.')
@@ -299,19 +314,17 @@ class PanelUI(QtWidgets.QMainWindow):
                 raise("Wrong width or height!")
             return w,h
         except Exception as e:
-            print(e.args)
+            rospy.logfatal(e.args)
             return -1,-1
 
     # fucntions used from outside
-    def showPath(self, path):
+    def showPath(self, path, status=None):
         self.draw_multi_targets = None
-        self.draw_target = None
-        self.draw_target = path
+        self.draw_target = (path, status)
         self.update()
 
     # fucntions used from outside
     def showDashBoard(self, paths, allstatus):
-        self.draw_multi_targets = None
         self.draw_target = None
         self.draw_multi_targets = (paths, allstatus)
         self.update()
@@ -335,6 +348,9 @@ class Console():
 
         self.ui = PanelUI(self.sendWaypoint, self.resetWaypoint, self.gridClicked, self.sizeChanged, self.changeTarget, self.sendPlane)
 
+        self.__init_targets()
+
+    def __init_targets(self):
         self.status = {}
         self.path = {}
         for item in [self.ui.targetlist.item(i) for i in range(self.ui.targetlist.count())]:
@@ -347,20 +363,42 @@ class Console():
     '''
     Private functions
     '''
+    # The console does not necessarily have the status of a target, and if not, return None
+    def __status(self, target):
+        if target in self.status.keys():
+            return self.status[target]
+        return None 
+
     def __path_cb(self, msg: Path):
         self.path[msg.target] = msg
-        self.ui.showPath(msg)
+        self.ui.showPath(msg, self.__status(msg.target))
         rospy.loginfo(f'Receive a path of target {msg.target}.')
 
     def __fleet_cb(self, msg: FleetStatus):
         for s in msg.fleet:
             self.status[s.target] = s
+            self.__isFinished(s)
 
         if self.ui.isDashBoardMode():
             self.ui.showDashBoard(self.path, self.status)
+        else:
+            target = self.ui.getTarget()
+            self.ui.showPath(self.path[target], self.__status(target))
+
+    def __isFinished(self, status):
+        if status is None:
+            return False
+        
+        target = status.target
+        if len(self.path[target].path)<=1:
+            return False
+
+        if status.next == self.path[target].path[-1]:
+            rospy.loginfo(f'Target {target} just finish the task!')
+            self.resetWaypoint(target)
 
     def __isNeighbor(self, a: Point, b : Point):
-        return abs(a.x-b.x)+abs(a.y-b.y) == 1 
+        return abs(a.x-b.x)+abs(a.y-b.y) <= 1 
 
     def __isContinuous(self, path: Path):
         for i in range(1, len(path.path)):
@@ -376,7 +414,7 @@ class Console():
         for k,v in self.path.items():
             if k != target:
                 for p in v.path:
-                    map[p.y, p.x] += 10
+                    map[p.y, p.x] = p.id
         costmap.data = map.reshape(-1)
         return costmap
 
@@ -384,16 +422,44 @@ class Console():
     injection callback for ui trigger
     '''
     def sizeChanged(self, w, h):
-        print(f'Set the map size to {w} by {h}')
+        rospy.loginfo(f'Set the map size to {w} by {h}')
+        self.__init_targets()
 
+    def sendOnePlane(self, target):
+        path = self.path[target]
 
-    def sendPlane(self, target):
-        path: Path = self.path[target]
         if not self.__isContinuous(path):
+            rospy.logdebug(f'Failed to assign a task with length:{len(path.path)} to target {target}.')
             return False
+
+        if len(path.path)<2:
+            rospy.logdebug(f'Failed! The task does not have enough points.')
+            return False
+
+        status = self.__status(target)
+        if status is not None:
+            if not (path.path[0].x == status.current.x and path.path[0].y == status.current.y):
+                rospy.logerr('Warning: The starting point of the path is not where the target is!')
+                return False
         
         self.plan_pub.publish(path)
         rospy.loginfo(f'Assign a task with length:{len(path.path)} to target {target}.')
+
+    def sendPlane(self, target=None):
+        if target is None:
+            for target in self.path.keys():
+                self.sendOnePlane(target)
+        else:
+            self.sendOnePlane(target)
+
+    def appendStatusInfo(self, req: PlanRequest):
+        target = req.target
+        status = self.__status(target)
+        if status is not None:
+            if not (status.current.x == req.waypoints.path[0].x and status.current.y == req.waypoints.path[0].y):
+                req.waypoints.path.insert(0, status.current)
+                rospy.loginfo(f'Automatically fill current position as the first waypoint.')
+            req.heading = status.heading
 
     def sendWaypoint(self, target):
         planRequest = PlanRequest()
@@ -401,8 +467,9 @@ class Console():
         planRequest.target = target
         planRequest.costmap = self.__generateCostMap(target)
         planRequest.waypoints = self.path[target]
+        self.appendStatusInfo(planRequest)
 
-        print(f'Send a task for {target} with {len(planRequest.waypoints.path)} waypoints.')
+        rospy.loginfo(f'Send a task for {target} with {len(planRequest.waypoints.path)} waypoints.')
         self.waypoint_pub.publish(planRequest)
         self.resetWaypoint(target)
 
@@ -414,20 +481,20 @@ class Console():
         path_length = len(self.path[target].path)
         pos = Point(x=x, y=y, id=path_length)
         self.path[target].path.append(pos)
-        self.ui.showPath(self.path[target])
-        print(f'Set {path_length}th waypoint as ({x},{y})')
+        self.ui.showPath(self.path[target], self.__status(target))
+        rospy.loginfo(f'Set {path_length}th waypoint as ({x},{y})')
 
     def changeTarget(self, target):
         if target == 'dashboard':
             self.ui.showDashBoard(self.path, self.status)
             rospy.loginfo(f'Switch to all target.')
         else:
-            self.ui.showPath(self.path[target])
+            self.ui.showPath(self.path[target], self.__status(target))
             rospy.loginfo(f'Switch to target {target}.')
 
 if __name__ == "__main__":
     import sys
     rospy.init_node('Console', anonymous=True, log_level=rospy.INFO)
-    app = QtWidgets.QApplication(sys.argv)
+    app = QApplication(sys.argv)
     Console = Console()
     sys.exit(app.exec_())

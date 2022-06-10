@@ -14,12 +14,8 @@ class DummyTarget():
 
     def action_cb(self, msg: String):
         self.action = msg.data
-
-        if self.action == 'STOP':
-            return
-
         rospy.loginfo(f'Receive an action {self.action}.')
-        rospy.sleep(0.1)
+        rospy.sleep(1)
         rospy.loginfo(f'Action done.')
         self.status_pub.publish(String(data=f'{self.target}/DONE'))
 
